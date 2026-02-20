@@ -228,7 +228,8 @@ class ReplaceContentTool(Tool, ToolMarkerCanEdit):
             if "\n" in matched_text and re.search(regex_pattern, matched_text[1:], flags=regex_flags):
                 raise ValueError(
                     "Match is ambiguous: the search pattern matches multiple overlapping occurrences. "
-                    "Please revise the search pattern to be more specific to avoid ambiguity."
+                    "Please revise the search pattern to be more specific to avoid ambiguity, "
+                    "e.g. by matching specific context after the match, or try using the literal mode."
                 )
 
             # Handle backreferences: replace $!1, $!2, etc. with actual matched groups
@@ -256,7 +257,7 @@ class ReplaceContentTool(Tool, ToolMarkerCanEdit):
         This function can be used internally by other tools.
         """
         self.project.validate_relative_path(relative_path, require_not_ignored=require_not_ignored)
-        with EditedFileContext(relative_path, self.agent) as context:
+        with EditedFileContext(relative_path, self.create_code_editor()) as context:
             original_content = context.get_original_content()
 
             if mode == "literal":

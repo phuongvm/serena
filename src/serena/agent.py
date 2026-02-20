@@ -2,12 +2,11 @@
 The Serena Model Context Protocol (MCP) Server
 """
 
-import multiprocessing
 import os
 import platform
+import subprocess
 import sys
-import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from logging import Logger
 from typing import TYPE_CHECKING, Optional, TypeVar
 
@@ -18,13 +17,13 @@ from interprompt.jinja_template import JinjaTemplate
 from serena import serena_version
 from serena.analytics import RegisteredTokenCountEstimator, ToolUsageStats
 from serena.config.context_mode import SerenaAgentContext, SerenaAgentMode
-from serena.config.serena_config import LanguageBackend, SerenaConfig, ToolInclusionDefinition
+from serena.config.serena_config import LanguageBackend, ModeSelectionDefinition, SerenaConfig, ToolInclusionDefinition
 from serena.dashboard import SerenaDashboardAPI
 from serena.ls_manager import LanguageServerManager
 from serena.project import Project
 from serena.prompt_factory import SerenaPromptFactory
 from serena.task_executor import TaskExecutor
-from serena.tools import ActivateProjectTool, GetCurrentConfigTool, ReplaceContentTool, Tool, ToolMarker, ToolRegistry
+from serena.tools import ActivateProjectTool, GetCurrentConfigTool, OpenDashboardTool, ReplaceContentTool, Tool, ToolMarker, ToolRegistry
 from serena.util.gui import system_has_usable_display
 from serena.util.inspection import iter_subclasses
 from serena.util.logging import MemoryLogHandler
@@ -53,7 +52,11 @@ class AvailableTools:
         :param tools: the list of available tools
         """
         self.tools = tools
-        self.tool_names = [tool.get_name_from_cls() for tool in tools]
+        self.tool_names = sorted([tool.get_name_from_cls() for tool in tools])
+        """
+        the list of available tool names, sorted alphabetically
+        """
+        self._tool_name_set = set(self.tool_names)
         self.tool_marker_names = set()
         for marker_class in iter_subclasses(ToolMarker):
             for tool in tools:
@@ -62,6 +65,9 @@ class AvailableTools:
 
     def __len__(self) -> int:
         return len(self.tools)
+
+    def contains_tool_name(self, tool_name: str) -> bool:
+        return tool_name in self._tool_name_set
 
 
 class ToolSet:
@@ -107,26 +113,35 @@ class ToolSet:
         registry = ToolRegistry()
         tool_names = set(self._tool_names)
         for definition in tool_inclusion_definitions:
-            included_tools = []
-            excluded_tools = []
-            for included_tool in definition.included_optional_tools:
-                included_tool = get_updated_tool_name(included_tool)
-                if not registry.is_valid_tool_name(included_tool):
-                    raise ValueError(f"Invalid tool name '{included_tool}' provided for inclusion")
-                if included_tool not in tool_names:
-                    tool_names.add(included_tool)
-                    included_tools.append(included_tool)
-            for excluded_tool in definition.excluded_tools:
-                excluded_tool = get_updated_tool_name(excluded_tool)
-                if not registry.is_valid_tool_name(excluded_tool):
-                    raise ValueError(f"Invalid tool name '{excluded_tool}' provided for exclusion")
-                if excluded_tool in tool_names:
-                    tool_names.remove(excluded_tool)
-                    excluded_tools.append(excluded_tool)
-            if included_tools:
-                log.info(f"{definition} included {len(included_tools)} tools: {', '.join(included_tools)}")
-            if excluded_tools:
-                log.info(f"{definition} excluded {len(excluded_tools)} tools: {', '.join(excluded_tools)}")
+            if definition.is_fixed_tool_set():
+                tool_names = set()
+                for fixed_tool in definition.fixed_tools:
+                    fixed_tool = get_updated_tool_name(fixed_tool)
+                    if not registry.is_valid_tool_name(fixed_tool):
+                        raise ValueError(f"Invalid tool name '{fixed_tool}' provided for fixed tool set")
+                    tool_names.add(fixed_tool)
+                log.info(f"{definition} defined a fixed tool set with {len(tool_names)} tools: {', '.join(tool_names)}")
+            else:
+                included_tools = []
+                excluded_tools = []
+                for included_tool in definition.included_optional_tools:
+                    included_tool = get_updated_tool_name(included_tool)
+                    if not registry.is_valid_tool_name(included_tool):
+                        raise ValueError(f"Invalid tool name '{included_tool}' provided for inclusion")
+                    if included_tool not in tool_names:
+                        tool_names.add(included_tool)
+                        included_tools.append(included_tool)
+                for excluded_tool in definition.excluded_tools:
+                    excluded_tool = get_updated_tool_name(excluded_tool)
+                    if not registry.is_valid_tool_name(excluded_tool):
+                        raise ValueError(f"Invalid tool name '{excluded_tool}' provided for exclusion")
+                    if excluded_tool in tool_names:
+                        tool_names.remove(excluded_tool)
+                        excluded_tools.append(excluded_tool)
+                if included_tools:
+                    log.info(f"{definition} included {len(included_tools)} tools: {', '.join(included_tools)}")
+                if excluded_tools:
+                    log.info(f"{definition} excluded {len(excluded_tools)} tools: {', '.join(excluded_tools)}")
         return ToolSet(tool_names)
 
     def without_editing_tools(self) -> "ToolSet":
@@ -152,6 +167,48 @@ class ToolSet:
         return tool_name in self._tool_names
 
 
+class ActiveModes:
+    def __init__(self) -> None:
+        self._base_modes: Sequence[str] | None = None
+        self._default_modes: Sequence[str] | None = None
+        self._active_mode_names: Sequence[str] | None = []
+        self._active_modes: Sequence[SerenaAgentMode] | None = []
+
+    def apply(self, mode_selection: ModeSelectionDefinition) -> None:
+        # invalidate active modes
+        self._active_mode_names = None
+        self._active_modes = None
+
+        # apply overrides
+        log.debug("Applying mode selection: default_modes=%s, base_modes=%s", mode_selection.default_modes, mode_selection.base_modes)
+        if mode_selection.base_modes is not None:
+            self._base_modes = mode_selection.base_modes
+        if mode_selection.default_modes is not None:
+            self._default_modes = mode_selection.default_modes
+        log.debug("Current mode selection: base_modes=%s, default_modes=%s", self._base_modes, self._default_modes)
+
+    def get_mode_names(self) -> Sequence[str]:
+        if self._active_mode_names is not None:
+            return self._active_mode_names
+        active_mode_names: set[str] = set()
+        if self._base_modes is not None:
+            active_mode_names.update(self._base_modes)
+        if self._default_modes is not None:
+            active_mode_names.update(self._default_modes)
+        self._active_mode_names = sorted(active_mode_names)
+        log.info("Active modes: %s", self._active_mode_names)
+        return self._active_mode_names
+
+    def get_modes(self) -> Sequence[SerenaAgentMode]:
+        if self._active_modes is not None:
+            return self._active_modes
+        self._active_modes = []
+        for mode_name in self.get_mode_names():
+            mode = SerenaAgentMode.load(mode_name)
+            self._active_modes.append(mode)
+        return self._active_modes
+
+
 class SerenaAgent:
     def __init__(
         self,
@@ -159,7 +216,7 @@ class SerenaAgent:
         project_activation_callback: Callable[[], None] | None = None,
         serena_config: SerenaConfig | None = None,
         context: SerenaAgentContext | None = None,
-        modes: list[SerenaAgentMode] | None = None,
+        modes: ModeSelectionDefinition | None = None,
         memory_log_handler: MemoryLogHandler | None = None,
     ):
         """
@@ -177,8 +234,14 @@ class SerenaAgent:
         # obtain serena configuration using the decoupled factory function
         self.serena_config = serena_config or SerenaConfig.from_config_file()
 
+        # propagate configuration to other components
+        self.serena_config.propagate_settings()
+
         # project-specific instances, which will be initialized upon project activation
         self._active_project: Project | None = None
+
+        # dashboard URL (set when dashboard is started)
+        self._dashboard_url: str | None = None
 
         # adjust log level
         serena_log_level = self.serena_config.log_level
@@ -195,7 +258,7 @@ class SerenaAgent:
 
         # open GUI log window if enabled
         self._gui_log_viewer: Optional["GuiLogViewer"] = None
-        if self.serena_config.gui_log_window_enabled:
+        if self.serena_config.gui_log_window:
             log.info("Opening GUI window")
             if platform.system() == "Darwin":
                 log.warning("GUI log window is not supported on macOS")
@@ -238,13 +301,25 @@ class SerenaAgent:
         self._check_shell_settings()
 
         # determine the base toolset defining the set of exposed tools (which e.g. the MCP shall see),
-        # limited by the Serena config, the context (which is fixed for the session) and JetBrains mode
-        tool_inclusion_definitions: list[ToolInclusionDefinition] = [self.serena_config, self._context]
+        # determined by the
+        #   * dashboard availability/opening on launch
+        #   * Serena config
+        #   * the context (which is fixed for the session)
+        #   * single-project mode reductions (if applicable)
+        #   * JetBrains mode
+        tool_inclusion_definitions: list[ToolInclusionDefinition] = []
+        if (
+            self.serena_config.web_dashboard
+            and not self.serena_config.web_dashboard_open_on_launch
+            and not self.serena_config.gui_log_window
+        ):
+            tool_inclusion_definitions.append(ToolInclusionDefinition(included_optional_tools=[OpenDashboardTool.get_name_from_cls()]))
+        tool_inclusion_definitions.append(self.serena_config)
+        tool_inclusion_definitions.append(self._context)
         if self._context.single_project:
             tool_inclusion_definitions.extend(self._single_project_context_tool_inclusion_definitions(project))
         if self.serena_config.language_backend == LanguageBackend.JETBRAINS:
             tool_inclusion_definitions.append(SerenaAgentMode.from_name_internal("jetbrains"))
-
         self._base_tool_set = ToolSet.default().apply(*tool_inclusion_definitions)
         self._exposed_tools = AvailableTools([t for t in self._all_tools.values() if self._base_tool_set.includes_name(t.get_name())])
         log.info(f"Number of exposed tools: {len(self._exposed_tools)}")
@@ -257,20 +332,19 @@ class SerenaAgent:
         self.prompt_factory = SerenaPromptFactory()
         self._project_activation_callback = project_activation_callback
 
-        # set the active modes
-        if modes is None:
-            modes = SerenaAgentMode.load_default_modes()
-        self._modes = modes
-
-        self._active_tools: dict[type[Tool], Tool] = {}
-        self._update_active_tools()
-
         # activate a project configuration (if provided or if there is only a single project available)
         if project is not None:
             try:
-                self.activate_project_from_path_or_name(project)
+                self.activate_project_from_path_or_name(project, update_modes_and_tools=False)
             except Exception as e:
                 log.error(f"Error activating project '{project}' at startup: {e}", exc_info=e)
+
+        # update active modes and active tools (considering the active project, if any)
+        # declared attributes are set in the call to _update_active_modes_and_tools()
+        self._mode_overrides = modes
+        self._active_modes: ActiveModes
+        self._active_tools: AvailableTools
+        self._update_active_modes_and_tools()
 
         # start the dashboard (web frontend), registering its log handler
         # should be the last thing to happen in the initialization since the dashboard
@@ -283,16 +357,10 @@ class SerenaAgent:
             if dashboard_host == "0.0.0.0":
                 dashboard_host = "localhost"
             dashboard_url = f"http://{dashboard_host}:{port}/dashboard/index.html"
+            self._dashboard_url = dashboard_url
             log.info("Serena web dashboard started at %s", dashboard_url)
             if self.serena_config.web_dashboard_open_on_launch:
-                if not system_has_usable_display():
-                    log.warning("Not opening the Serena web dashboard automatically because no usable display was detected.")
-                else:
-                    # open the dashboard URL in the default web browser (using a separate process to control
-                    # output redirection)
-                    process = multiprocessing.Process(target=self._open_dashboard, args=(dashboard_url,))
-                    process.start()
-                    process.join(timeout=1)
+                self.open_dashboard()
             # inform the GUI window (if any)
             if self._gui_log_viewer is not None:
                 self._gui_log_viewer.set_dashboard_url(dashboard_url)
@@ -347,7 +415,7 @@ class SerenaAgent:
 
     def _single_project_context_tool_inclusion_definitions(self, project_root_or_name: str | None) -> list[ToolInclusionDefinition]:
         """
-        In the IDE assistant context, the agent is assumed to work on a single project, and we thus
+        When in a single-project context, the agent is assumed to work on a single project, and we thus
         want to apply that project's tool exclusions/inclusions from the get-go, limiting the set
         of tools that will be exposed to the client.
         Furthermore, we disable tools that are only relevant for project activation.
@@ -384,17 +452,34 @@ class SerenaAgent:
         log.debug(f"Recording tool usage for tool '{tool_name}'")
         self._tool_usage_stats.record_tool_usage(tool_name, input_str, output_str)
 
-    @staticmethod
-    def _open_dashboard(url: str) -> None:
-        # Redirect stdout and stderr file descriptors to /dev/null,
-        # making sure that nothing can be written to stdout/stderr, even by subprocesses
-        null_fd = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(null_fd, sys.stdout.fileno())
-        os.dup2(null_fd, sys.stderr.fileno())
-        os.close(null_fd)
+    def get_dashboard_url(self) -> str | None:
+        """
+        :return: the URL of the web dashboard, or None if the dashboard is not running
+        """
+        return self._dashboard_url
 
-        # open the dashboard URL in the default web browser
-        webbrowser.open(url)
+    def open_dashboard(self) -> bool:
+        """
+        Opens the Serena web dashboard in the default web browser.
+
+        :return: a message indicating success or failure
+        """
+        if self._dashboard_url is None:
+            raise Exception("Dashboard is not running.")
+
+        if not system_has_usable_display():
+            log.warning("Not opening the Serena web dashboard because no usable display was detected.")
+            return False
+
+        # Use a subprocess to avoid any output from webbrowser.open being written to stdout
+        subprocess.Popen(
+            [sys.executable, "-c", f"import webbrowser; webbrowser.open({self._dashboard_url!r})"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,  # Detach from parent process
+        )
+        return True
 
     def get_project_root(self) -> str:
         """
@@ -431,34 +516,35 @@ class SerenaAgent:
             raise ValueError("No active project. Please activate a project first.")
         return project
 
-    def set_modes(self, modes: list[SerenaAgentMode]) -> None:
+    def set_modes(self, mode_names: list[str]) -> None:
         """
         Set the current mode configurations.
 
-        :param modes: List of mode names or paths to use
+        :param mode_names: List of mode names or paths to use
         """
-        self._modes = modes
-        self._update_active_tools()
+        self._mode_overrides = ModeSelectionDefinition(default_modes=mode_names)
+        self._update_active_modes_and_tools()
 
-        log.info(f"Set modes to {[mode.name for mode in modes]}")
+        log.info(f"Set modes to {[mode.name for mode in self.get_active_modes()]}")
 
     def get_active_modes(self) -> list[SerenaAgentMode]:
         """
         :return: the list of active modes
         """
-        return list(self._modes)
+        return list(self._active_modes.get_modes())
 
     def _format_prompt(self, prompt_template: str) -> str:
         template = JinjaTemplate(prompt_template)
         return template.render(available_tools=self._exposed_tools.tool_names, available_markers=self._exposed_tools.tool_marker_names)
 
     def create_system_prompt(self) -> str:
-        available_markers = self._exposed_tools.tool_marker_names
-        log.info("Generating system prompt with available_tools=(see exposed tools), available_markers=%s", available_markers)
+        available_tools = self._active_tools
+        available_markers = available_tools.tool_marker_names
+        log.info("Generating system prompt with available_tools=(see active tools), available_markers=%s", available_markers)
         system_prompt = self.prompt_factory.create_system_prompt(
             context_system_prompt=self._format_prompt(self._context.prompt),
-            mode_system_prompts=[self._format_prompt(mode.prompt) for mode in self._modes],
-            available_tools=self._exposed_tools.tool_names,
+            mode_system_prompts=[self._format_prompt(mode.prompt) for mode in self.get_active_modes()],
+            available_tools=available_tools.tool_names,
             available_markers=available_markers,
         )
 
@@ -469,25 +555,33 @@ class SerenaAgent:
         log.info("System prompt:\n%s", system_prompt)
         return system_prompt
 
-    def _update_active_tools(self) -> None:
+    def _update_active_modes_and_tools(self) -> None:
         """
-        Update the active tools based on enabled modes and the active project.
+        Updates the active modes and, subsequently, the active tools based on the modes and the active project.
         The base tool set already takes the Serena configuration and the context into account
         (as well as any internal modes that are not handled dynamically, such as JetBrains mode).
         """
-        tool_set = self._base_tool_set.apply(*self._modes)
+        # determine active modes from serena config, active project, and mode overrides
+        self._active_modes = ActiveModes()
+        self._active_modes.apply(self.serena_config)
+        if self._active_project:
+            self._active_modes.apply(self._active_project.project_config)
+        if self._mode_overrides:
+            self._active_modes.apply(self._mode_overrides)
+
+        # apply modes
+        tool_set = self._base_tool_set.apply(*self._active_modes.get_modes())
+
+        # apply active project configuration (if any)
         if self._active_project is not None:
             tool_set = tool_set.apply(self._active_project.project_config)
             if self._active_project.project_config.read_only:
                 tool_set = tool_set.without_editing_tools()
 
-        self._active_tools = {
-            tool_class: tool_instance
-            for tool_class, tool_instance in self._all_tools.items()
-            if tool_set.includes_name(tool_instance.get_name())
-        }
+        tools = [t for t in self._all_tools.values() if tool_set.includes_name(t.get_name())]
+        self._active_tools = AvailableTools(tools)
 
-        log.info(f"Active tools ({len(self._active_tools)}): {', '.join(self.get_active_tool_names())}")
+        log.info(f"Active tools ({len(self._active_tools)}): {', '.join(self._active_tools.tool_names)}")
 
     def issue_task(
         self, task: Callable[[], T], name: str | None = None, logged: bool = True, timeout: float | None = None
@@ -523,10 +617,12 @@ class SerenaAgent:
         """
         return self.serena_config.language_backend == LanguageBackend.LSP
 
-    def _activate_project(self, project: Project) -> None:
+    def _activate_project(self, project: Project, update_modes_and_tools: bool = True) -> None:
         log.info(f"Activating {project.project_name} at {project.project_root}")
         self._active_project = project
-        self._update_active_tools()
+
+        if update_modes_and_tools:
+            self._update_active_modes_and_tools()
 
         def init_language_server_manager() -> None:
             # start the language server
@@ -557,7 +653,7 @@ class SerenaAgent:
             log.info(f"Added new project {project_instance.project_name} for path {project_instance.project_root}")
         return project_instance
 
-    def activate_project_from_path_or_name(self, project_root_or_name: str) -> Project:
+    def activate_project_from_path_or_name(self, project_root_or_name: str, update_modes_and_tools: bool = True) -> Project:
         """
         Activate a project from a path or a name.
         If the project was already registered, it will just be activated.
@@ -573,30 +669,21 @@ class SerenaAgent:
                 f"Project '{project_root_or_name}' not found: Not a valid project name or directory. "
                 f"Existing project names: {self.serena_config.project_names}"
             )
-        self._activate_project(project_instance)
+        self._activate_project(project_instance, update_modes_and_tools=update_modes_and_tools)
         return project_instance
-
-    def get_active_tool_classes(self) -> list[type["Tool"]]:
-        """
-        :return: the list of active tool classes for the current project
-        """
-        return list(self._active_tools.keys())
 
     def get_active_tool_names(self) -> list[str]:
         """
-        :return: the list of names of the active tools for the current project
+        :return: the list of names of the active tools for the current project, sorted alphabetically
         """
-        return sorted([tool.get_name_from_cls() for tool in self.get_active_tool_classes()])
+        return self._active_tools.tool_names
 
-    def tool_is_active(self, tool_class: type["Tool"] | str) -> bool:
+    def tool_is_active(self, tool_name: str) -> bool:
         """
-        :param tool_class: the class or name of the tool to check
+        :param tool_class: the name of the tool to check
         :return: True if the tool is active, False otherwise
         """
-        if isinstance(tool_class, str):
-            return tool_class in self.get_active_tool_names()
-        else:
-            return tool_class in self.get_active_tool_classes()
+        return self._active_tools.contains_tool_name(tool_name)
 
     def get_current_config_overview(self) -> str:
         """
@@ -685,7 +772,7 @@ class SerenaAgent:
         return self._all_tools[tool_class]  # type: ignore
 
     def print_tool_overview(self) -> None:
-        ToolRegistry().print_tool_overview(self._active_tools.values())
+        ToolRegistry().print_tool_overview(self._active_tools.tools)
 
     def __del__(self) -> None:
         self.shutdown()
@@ -708,3 +795,9 @@ class SerenaAgent:
     def get_tool_by_name(self, tool_name: str) -> Tool:
         tool_class = ToolRegistry().get_tool_class_by_name(tool_name)
         return self.get_tool(tool_class)
+
+    def get_active_lsp_languages(self) -> list[Language]:
+        ls_manager = self.get_language_server_manager()
+        if ls_manager is None:
+            return []
+        return ls_manager.get_active_languages()

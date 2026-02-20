@@ -40,56 +40,74 @@ class LogMessage {
     };
 }
 
-class SponsorRotation {
+function updateThemeAwareImage($img, theme=null) {
+    if (!theme) {
+        const isDarkMode = $('html').data("theme") == 'dark';
+        theme = isDarkMode ? 'dark' : 'light';
+    }
+    console.log("updating theme-aware image to theme:", theme);
+    const newSrc = $img.data('src-' + theme);
+    if (newSrc) {
+        $img.attr('src', newSrc);
+    }
+}
+
+class BannerRotation {
     constructor() {
         this.platinumIndex = 0;
         this.goldIndex = 0;
         this.platinumTimer = null;
         this.goldTimer = null;
-        this.platinumInterval = 5000;
-        this.goldInterval = 5000;
+        this.platinumInterval = 15000;
+        this.goldInterval = 15000;
 
         this.init();
     }
 
     init() {
         let self = this;
-        this.loadSponsors(function() {
+        this.loadBanners(function() {
             self.startPlatinumRotation();
             self.startGoldRotation();
         });
     }
 
-    loadSponsors(onSuccess) {
+    loadBanners(onSuccess) {
         $.ajax({
-            url: 'https://oraios-software.de/serena-sponsors/manifest.php',
+            url: 'https://oraios-software.de/serena-banners/manifest.php',
             type: 'GET',
             success: function (response) {
-                console.log('Sponsors loaded:', response);
+                console.log('Banners loaded:', response);
 
-                function fillSponsors($container, sponsors, className) {
-                    $.each(sponsors, function (index, sponsor) {
-                        let $img = $('<img src="' + sponsor.image + '" alt="' + sponsor.alt + '" class="sponsor-image">');
-                        let $anchor = $('<a href="' + sponsor.link + '" target="_blank"></a>');
+                function fillBanners($container, banners, className) {
+                    $.each(banners, function (index, banner) {
+                        let $img = $('<img src="' + banner.image + '" alt="' + banner.alt + '" class="banner-image">');
+                        if (banner.image_dark) {
+                            $img.addClass('theme-aware-img');
+                            $img.attr('data-src-dark', banner.image_dark);
+                            $img.attr('data-src-light', banner.image);
+                            updateThemeAwareImage($img);
+                        }
+                        let $anchor = $('<a href="' + banner.link + '" target="_blank"></a>');
                         $anchor.append($img);
-                        let $sponsor = $('<div class="' + className + '-slide" data-sponsor="' + (index + 1) + '"></div>');
-                        $sponsor.append($anchor);
+                        let $banner = $('<div class="' + className + '-slide" data-banner="' + (index + 1) + '"></div>');
+                        $banner.append($anchor);
                         if (index === 0) {
-                            $sponsor.addClass('active');
+                            $banner.addClass('active');
                         }
-                        if (sponsor.border) {
-                            $img.addClass('sponsor-border');
+                        if (banner.border) {
+                            $img.addClass('banner-border');
                         }
-                        $container.append($sponsor);
+                        $container.append($banner);
                     });
                 }
 
-                fillSponsors($('#gold-sponsors'), response.gold, 'gold-sponsor');
-                fillSponsors($('#platinum-sponsors'), response.platinum, 'platinum-sponsor');
+                fillBanners($('#gold-banners'), response.gold, 'gold-banner');
+                fillBanners($('#platinum-banners'), response.platinum, 'platinum-banner');
                 onSuccess();
             },
             error: function (xhr, status, error) {
-                console.error('Error loading sponsors:', error);
+                console.error('Error loading banners:', error);
             }
         });
     }
@@ -109,7 +127,7 @@ class SponsorRotation {
     }
 
     rotatePlatinum(direction) {
-        const $slides = $('.platinum-sponsor-slide');
+        const $slides = $('.platinum-banner-slide');
         const total = $slides.length;
 
         if (total === 0) return;
@@ -133,7 +151,7 @@ class SponsorRotation {
     }
 
     rotateGold(direction) {
-        const $groups = $('.gold-sponsor-slide');
+        const $groups = $('.gold-banner-slide');
         const total = $groups.length;
 
         if (total === 0) return;
@@ -193,7 +211,9 @@ class Dashboard {
         // jQuery elements
         this.$logContainer = $('#log-container');
         this.$errorContainer = $('#error-container');
+        this.$saveLogsBtn = $('#save-logs-btn');
         this.$copyLogsBtn = $('#copy-logs-btn');
+        this.$clearLogsBtn = $('#clear-logs-btn');
         this.$menuToggle = $('#menu-toggle');
         this.$menuDropdown = $('#menu-dropdown');
         this.$menuShutdown = $('#menu-shutdown');
@@ -250,6 +270,8 @@ class Dashboard {
         this.$editSerenaConfigSaveBtn = $('#edit-serena-config-save-btn');
         this.$editSerenaConfigCancelBtn = $('#edit-serena-config-cancel-btn');
         this.$modalCloseEditSerenaConfig = $('.modal-close-edit-serena-config');
+        this.$newsSection = $('#news-section');
+        this.$newsDisplay = $('#news-display');
 
         // Chart references
         this.countChart = null;
@@ -258,7 +280,9 @@ class Dashboard {
         this.outputChart = null;
 
         // Register event handlers
+        this.$saveLogsBtn.click(this.saveLogs.bind(this));
         this.$copyLogsBtn.click(this.copyLogs.bind(this));
+        this.$clearLogsBtn.click(this.clearLogs.bind(this));
         this.$menuShutdown.click(function (e) {
             e.preventDefault();
             self.shutdown();
@@ -360,8 +384,8 @@ class Dashboard {
         // Initialize theme
         this.initializeTheme();
 
-        // Initialize sponsor rotation
-        //this.sponsorRotation = new SponsorRotation();
+        // Initialize banner rotation
+        this.bannerRotation = new BannerRotation();
 
         // Add ESC key handler for closing modals
         $(document).keydown(function (e) {
@@ -383,6 +407,7 @@ class Dashboard {
         // Initialize the application
         this.loadToolNames().then(function () {
             // Start on overview page
+            self.loadNews();
             self.loadConfigOverview();
             self.startConfigPolling();
             self.startExecutionsPolling();
@@ -436,6 +461,7 @@ class Dashboard {
 
         // Start appropriate polling for the page
         if (page === 'overview') {
+            this.loadNews();
             this.loadConfigOverview();
             this.startConfigPolling();
             this.startExecutionsPolling();
@@ -596,6 +622,10 @@ class Dashboard {
             // File Encoding info
             html += '<div class="config-label">File Encoding:</div>';
             html += '<div class="config-value">' + (config.encoding || 'N/A') + '</div>';
+
+            // Current Client info
+            html += '<div class="config-label">Current Client:</div>';
+            html += '<div class="config-value">' + (config.current_client || 'None') + '</div>';
 
             html += '</div>';
 
@@ -1086,19 +1116,39 @@ class Dashboard {
         document.title = activeProject ? `${activeProject} – Serena Dashboard` : 'Serena Dashboard';
     }
 
+    updateLogButtons(hasLogs) {
+        this.$saveLogsBtn.prop('disabled', !hasLogs);
+        this.$copyLogsBtn.prop('disabled', !hasLogs);
+        this.$clearLogsBtn.prop('disabled', !hasLogs);
+    }
+
+    saveLogs() {
+        const logText = this.$logContainer.text();
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const blob = new Blob([logText], {type: 'text/plain'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `serena-logs-${timestamp}.txt`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        const originalHtml = this.$saveLogsBtn.html();
+        const checkmarkSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg><span class="log-action-btn-text">save logs</span>';
+        this.$saveLogsBtn.html(checkmarkSvg);
+        setTimeout(() => { this.$saveLogsBtn.html(originalHtml); }, 1500);
+    }
+
     copyLogs() {
         const logText = this.$logContainer.text();
-
-        if (!logText) {
-            alert('No logs to copy');
-            return;
-        }
 
         // Use the Clipboard API to copy text
         navigator.clipboard.writeText(logText).then(() => {
             // Visual feedback - temporarily change icon to grey checkmark
             const originalHtml = this.$copyLogsBtn.html();
-            const checkmarkSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg><span class="copy-logs-text">copy logs</span>';
+            const checkmarkSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg><span class="log-action-btn-text">copy logs</span>';
             this.$copyLogsBtn.html(checkmarkSvg);
 
             setTimeout(() => {
@@ -1106,7 +1156,27 @@ class Dashboard {
             }, 1500);
         }).catch(err => {
             console.error('Failed to copy logs:', err);
-            alert('Failed to copy logs to clipboard');
+        });
+    }
+
+    clearLogs() {
+        let self = this;
+        $.ajax({
+            url: '/clear_logs',
+            type: 'POST',
+            success: function () {
+                self.$logContainer.empty();
+                self.currentMaxIdx = -1;
+                self.updateLogButtons(false);
+
+                const originalHtml = self.$clearLogsBtn.html();
+                const checkmarkSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg><span class="log-action-btn-text">clear logs</span>';
+                self.$clearLogsBtn.html(checkmarkSvg);
+                setTimeout(() => { self.$clearLogsBtn.html(originalHtml); }, 1500);
+            },
+            error: function (xhr, status, error) {
+                console.error('Failed to clear logs:', error);
+            }
         });
     }
 
@@ -1140,6 +1210,7 @@ class Dashboard {
                     $('#log-container').html('<div class="loading">No log messages found.</div>');
                 }
 
+                self.updateLogButtons(response.messages && response.messages.length > 0);
                 self.updateTitle(response.active_project);
 
                 // Start periodic polling for new logs
@@ -1179,6 +1250,8 @@ class Dashboard {
 
                     // Update max_idx
                     self.currentMaxIdx = response.max_idx || self.currentMaxIdx;
+
+                    self.updateLogButtons(true);
 
                     // Auto-scroll to bottom if user was already at bottom
                     if (wasAtBottom) {
@@ -1463,6 +1536,9 @@ class Dashboard {
         this.setTheme(newTheme);
     }
 
+    /**
+     * @param theme {'light' | 'dark'}
+     */
     setTheme(theme) {
         // Set the theme on the document element
         document.documentElement.setAttribute('data-theme', theme);
@@ -1476,25 +1552,17 @@ class Dashboard {
             this.$themeText.text('Dark');
         }
 
-        // Update the logo based on theme
-        this.updateLogo(theme);
+        // Update theme-aware images
+        $(".theme-aware-img").each(function() {
+            const $img = $(this);
+            updateThemeAwareImage($img, theme);
+        });
 
         // Save to localStorage
         localStorage.setItem('serena-theme', theme);
 
         // Update charts if they exist
         this.updateChartsTheme();
-    }
-
-    updateLogo(theme) {
-        const logoElement = document.getElementById('serena-logo');
-        if (logoElement) {
-            if (theme === 'dark') {
-                logoElement.src = 'serena-logo-dark-mode.svg';
-            } else {
-                logoElement.src = 'serena-logo.svg';
-            }
-        }
     }
 
     updateChartsTheme() {
@@ -1860,6 +1928,104 @@ class Dashboard {
                 console.error('Error creating memory:', error);
                 alert('Error creating memory: ' + (xhr.responseJSON ? xhr.responseJSON.message : error));
                 self.$createMemoryCreateBtn.prop('disabled', false).text('Create');
+            }
+        });
+    }
+
+    // ===== News Methods =====
+
+    loadNews() {
+        let self = this;
+        console.log('Loading news...');
+        $.ajax({
+            url: '/news_snippet_ids',
+            type: 'GET',
+            success: function(response) {
+                console.log('News snippet IDs response:', response);
+                if (response.status === 'success' && response.news_snippet_ids && response.news_snippet_ids.length > 0) {
+                    console.log('Displaying news with IDs:', response.news_snippet_ids);
+                    self.displayNews(response.news_snippet_ids);
+                } else {
+                    console.log('No unread news, hiding section');
+                    self.$newsSection.hide();
+                }
+            },
+            error: function(xhr, status, error) {
+                console.error('Error loading news snippet IDs:', error);
+                self.$newsSection.hide();
+            }
+        });
+    }
+
+    displayNews(newsIds) {
+        let self = this;
+        console.log('displayNews called with:', newsIds);
+        // Sort newest first (descending order)
+        newsIds.sort((a, b) => b - a);
+        
+        if (newsIds.length === 0) {
+            console.log('No news items to display.');
+            self.$newsSection.hide();
+            return;
+        }
+        self.$newsSection.show();
+        self.$newsDisplay.empty();
+        console.log('Displaying ' + newsIds.length + ' news items.');
+        // Load each news snippet HTML
+        let loadedCount = 0;
+        newsIds.forEach(function(newsId) {
+            $.ajax({
+                url: '/dashboard/news/' + newsId + '.html',
+                type: 'GET',
+                success: function(html) {
+                    // Wrap the HTML in a container with a button
+                    let $newsContainer = $('<div class="news-container">').attr('data-news-id', newsId);
+                    let $newsContent = $(html);
+                    
+                    // Add button for marking as read
+                    let $markRead = $('<div class="news-mark-read">');
+                    let $button = $('<button class="news-mark-read-btn">').attr('data-news-id', newsId).text('Mark as read');
+
+                    $markRead.append($button);
+                    $newsContent.append($markRead);
+                    
+                    $newsContainer.append($newsContent);
+                    self.$newsDisplay.append($newsContainer);
+                    
+                    // Bind button click event
+                    $button.on('click', function() {
+                        const btn = $(this);
+                        btn.prop('disabled', true).text('Marking...');
+                        self.markNewsAsRead(newsId);
+                    });
+                    
+                    loadedCount++;
+                },
+                error: function(xhr, status, error) {
+                    console.error('Error loading news snippet ' + newsId + ':', error);
+                    loadedCount++;
+                }
+            });
+        });
+    }
+
+    markNewsAsRead(newsId) {
+        let self = this;
+        $.ajax({
+            url: '/mark_news_snippet_as_read',
+            type: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({ news_snippet_id: newsId }),
+            success: function(response) {
+                if (response.status === 'success') {
+                    // Reload news to show updated list
+                    self.loadNews();
+                } else {
+                    console.error('Error marking news as read:', response.message);
+                }
+            },
+            error: function(xhr, status, error) {
+                console.error('Error marking news as read:', error);
             }
         });
     }
